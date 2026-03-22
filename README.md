@@ -20,8 +20,8 @@ A fast and efficient Python script that extracts passwords from blind SQL inject
 ## 🛠️ Installation
 
 ```bash
-git clone https://github.com/Hasrat270/ClusterBombForPortSwiggerLab.git
-cd ClusterBombForPortSwiggerLab
+git clone https://github.com/Hasrat270/BinarySearch.git
+cd BinarySearch
 pip install requests
 ```
 
